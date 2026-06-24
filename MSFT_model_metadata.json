@@ -1,0 +1,73 @@
+{
+  "ticker": "MSFT",
+  "sector": "Technology",
+  "sector_etf": "XLK",
+  "trained_at": "2026-05-28T22:34:15",
+  "data_start": "2012-03-14",
+  "data_end": "2026-05-28",
+  "n_rows": 3571,
+  "n_features": 17,
+  "features": [
+    "Close",
+    "Volume",
+    "EMA_20",
+    "RSI_14",
+    "MACD",
+    "OBV",
+    "GC_spread",
+    "BB_width",
+    "ATR_14",
+    "STOCH_K",
+    "SPY_ret",
+    "SECT_ret",
+    "RATE_ch",
+    "RV_5",
+    "RV_20",
+    "RV_60",
+    "EARN_flag"
+  ],
+  "quantiles": [
+    0.1,
+    0.5,
+    0.9
+  ],
+  "config": {
+    "period": "15y",
+    "window": 60,
+    "horizon": 20,
+    "hidden_dim": 64,
+    "num_layers": 2,
+    "dropout": 0.35,
+    "bidirectional": true,
+    "spearman_w": 0.3,
+    "n_ensemble": 5,
+    "batch_size": 64,
+    "lr": 0.0003
+  },
+  "test_metrics": {
+    "rmse": 6.977944374084473,
+    "mae": 5.359918117523193,
+    "dir_acc": 0.48643410852713176,
+    "ic": 0.21123283605150417,
+    "coverage": 0.7616279069767442
+  },
+  "backtest": {
+    "sharpe": 0.10353326282191637,
+    "max_dd": 30.86092445254326,
+    "total_ret": 5.866536086425185,
+    "win_rate": 0.46153846153846156,
+    "n_trades": 26
+  },
+  "forecast": {
+    "from_date": "2026-05-28",
+    "horizon_days": 20,
+    "current_close": 426.989990234375,
+    "p10_pct": -6.2947,
+    "p50_pct": 0.764,
+    "p90_pct": 8.7798,
+    "price_low": 400.11,
+    "price_mid": 430.25,
+    "price_high": 464.48,
+    "signal": "BUY"
+  }
+}
