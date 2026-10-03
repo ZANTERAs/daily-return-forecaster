@@ -3,6 +3,7 @@ import json
 import time
 import re
 from datetime import date, datetime
+from pathlib import Path
 import yfinance as yf
 
 # Force UTF-8 output on Windows (avoids cp1252 UnicodeEncodeError for box/arrow chars)
@@ -17,8 +18,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -92,7 +91,8 @@ def _get_sector_etf(ticker: str) -> tuple:
     return "Unknown", "SPY"
 
 
-_SECTOR_NAME, SECTOR_ETF = _get_sector_etf(TICKER)
+# Resolved in main() / train_and_forecast() (no network at import time).
+_SECTOR_NAME, SECTOR_ETF = "Unknown", "SPY"
 
 
 # ── Period helper ─────────────────────────────────────────────────────────────
@@ -174,7 +174,26 @@ def load_and_prepare_data(ticker: str, period: str) -> pd.DataFrame:
         )
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.droplevel(1)
-    df = raw[["High", "Low", "Close", "Volume"]].dropna()
+
+    print(f"[3/4] Fetching market context: SPY / {SECTOR_ETF} / ^TNX...", end="", flush=True)
+    spy            = _fetch_close("SPY",       period)
+    sect           = _fetch_close(SECTOR_ETF,  period)
+    tnx            = _fetch_close("^TNX",      period)
+    print(" done")
+    print(f"[4/4] Fetching earnings calendar...", end="", flush=True)
+    earn_dates = _get_earnings_dates(ticker)
+    print(" done")
+    return build_features(raw, spy, sect, tnx, earn_dates)
+
+
+def build_features(ohlcv: pd.DataFrame, spy: pd.Series, sect: pd.Series,
+                   tnx: pd.Series, earn_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Pure feature engineering (no network): technical indicators, realized vol,
+    market context and earnings flag.  `ohlcv` needs High/Low/Close/Volume;
+    `spy`, `sect`, `tnx` are daily Close series; `earn_dates` tz-naive dates.
+    """
+    df = ohlcv[["High", "Low", "Close", "Volume"]].dropna().copy()
     high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
     print(f"      {len(df)} rows  [{df.index[0].date()} – {df.index[-1].date()}]")
 
@@ -203,12 +222,6 @@ def load_and_prepare_data(ticker: str, period: str) -> pd.DataFrame:
     print(" done  (EMA, RSI, MACD, OBV, GC, BB, ATR, STOCH, RV×3)")
 
     # ── Market context (regime awareness) ────────────────────────────────────
-    print(f"[3/4] Fetching market context: SPY / {SECTOR_ETF} / ^TNX...", end="", flush=True)
-    spy            = _fetch_close("SPY",       period)
-    sect           = _fetch_close(SECTOR_ETF,  period)
-    tnx            = _fetch_close("^TNX",      period)
-    print(" done")
-
     df["SPY_ret"]  = spy.pct_change(20).mul(100).reindex(df.index)
     df["SECT_ret"] = sect.pct_change(20).mul(100).reindex(df.index)
     df["RATE_ch"]  = tnx.diff(20).reindex(df.index)
@@ -216,8 +229,6 @@ def load_and_prepare_data(ticker: str, period: str) -> pd.DataFrame:
     # ── Earnings calendar ─────────────────────────────────────────────────────
     # Flags the EARN_LOOKAHEAD calendar days before each earnings date as 1.
     # Valid: earnings dates are publicly scheduled, so this is not look-ahead bias.
-    print(f"[4/4] Fetching earnings calendar...", end="", flush=True)
-    earn_dates = _get_earnings_dates(ticker)
     df["EARN_flag"] = 0.0
     if len(earn_dates) > 0:
         idx_norm = df.index.normalize()
@@ -611,6 +622,9 @@ def plot(test_dates, true_returns: np.ndarray, pred_q: np.ndarray,
     Panel 1: Test set — actual return vs P50 prediction with P10/P90 confidence band.
     Panel 2: Ensemble forecast — P10 / P50 / P90 for the next HORIZON days.
     """
+    import plotly.graph_objects as go            # lazy: batch runs never plot
+    from plotly.subplots import make_subplots
+
     p10 = pred_q[:, 0]
     p50 = pred_q[:, 1]
     p90 = pred_q[:, 2]
@@ -691,10 +705,21 @@ def plot(test_dates, true_returns: np.ndarray, pred_q: np.ndarray,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    global QUANTILES, N_Q
+def train_and_forecast(df: pd.DataFrame, ticker: str, sector: str, sector_etf: str,
+                       model_dir) -> dict:
+    """
+    Pure training + forecast on an already-built feature frame (see build_features).
+    Same steps as the original main(): quantile calibration, walk-forward, final
+    ensemble, forecast.  Saves <ticker>_lstm_e{seed}.pt and <ticker>_model_metadata.json
+    in `model_dir`.  The metadata adds the walk-forward averages (wf_metrics, incl.
+    wf_ic_mean) and the fitted MinMaxScaler so forecast_from_saved() can reuse it.
+    Returns the metadata dict plus a non-persisted "_plot" entry for plot().
+    """
+    global QUANTILES, N_Q, TICKER, _SECTOR_NAME, SECTOR_ETF
+    TICKER, _SECTOR_NAME, SECTOR_ETF = ticker, sector, sector_etf
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    df        = load_and_prepare_data(TICKER, PERIOD)
     values    = df[FEAT_COLS].values
     close_raw = df["Close"].values
     n, n_feat = values.shape
@@ -732,7 +757,10 @@ def main():
     print("\n" + "=" * 78)
     print("STEP 1 / 2  —  Walk-forward validation")
     print("=" * 78)
-    walk_forward_evaluate(values, close_raw, n_feat)
+    wf_results = walk_forward_evaluate(values, close_raw, n_feat)
+    wf_metrics = {f"wf_{m}_mean": float(np.mean([r[m] for r in wf_results])) if wf_results else None
+                  for m in ("rmse", "mae", "dir_acc", "ic", "coverage")}
+    wf_metrics["wf_folds"] = len(wf_results)
 
     # ── Final ensemble model ───────────────────────────────────────────────────
     print("\n" + "=" * 78)
@@ -781,7 +809,7 @@ def main():
         models.append(m)
         # Save underlying module (unwrap compile wrapper if present)
         base = getattr(m, "_orig_mod", m)
-        torch.save(base.state_dict(), f"{TICKER}_lstm_e{seed}.pt")
+        torch.save(base.state_dict(), model_dir / f"{TICKER}_lstm_e{seed}.pt")
 
     ens_sec = time.time() - ens_t0
     print(f"\n{'=' * 78}")
@@ -844,6 +872,8 @@ def main():
             "lr":            LR,
         },
         "test_metrics": test_met,
+        "wf_metrics":   wf_metrics,
+        "scaler":       {"data_min": scaler.data_min_.tolist(), "data_max": scaler.data_max_.tolist()},
         "backtest":     backtest,
         "forecast": {
             "from_date":     str(df.index[-1].date()),
@@ -858,13 +888,67 @@ def main():
             "signal":        signal_str,
         },
     }
-    meta_path = f"{TICKER}_model_metadata.json"
+    meta_path = model_dir / f"{TICKER}_model_metadata.json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
     print(f"\nMetadata saved → {meta_path}")
 
-    plot(test_signal_dates, true_r, pred_q,
-         current_close, fc_p10, fc_p50, fc_p90)
+    metadata["_plot"] = (test_signal_dates, true_r, pred_q,
+                         current_close, fc_p10, fc_p50, fc_p90)
+    return metadata
+
+
+def forecast_from_saved(df: pd.DataFrame, ticker: str, model_dir,
+                        max_age_days: int = 28):
+    """
+    Reuse saved ensemble weights if they are younger than `max_age_days`:
+    rebuilds the models from metadata, scales `df` with the SAVED scaler (fitted
+    at training time) and forecasts from the last WINDOW rows.  Returns the saved
+    metadata with an updated "forecast" block, or None if there is nothing
+    reusable (missing/old files, or metadata without scaler from older versions).
+    """
+    global QUANTILES, N_Q
+    model_dir = Path(model_dir)
+    meta_path = model_dir / f"{ticker}_model_metadata.json"
+    if not meta_path.exists():
+        return None
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    age  = (datetime.now() - datetime.fromisoformat(meta["trained_at"])).days
+    pts  = [model_dir / f"{ticker}_lstm_e{s}.pt" for s in range(meta["config"]["n_ensemble"])]
+    if age >= max_age_days or "scaler" not in meta or not all(p.exists() for p in pts):
+        return None
+
+    QUANTILES = meta["quantiles"]
+    N_Q       = len(QUANTILES)
+    values    = df[meta["features"]].values
+    lo, hi    = np.array(meta["scaler"]["data_min"]), np.array(meta["scaler"]["data_max"])
+    scaled    = (values - lo) / np.where(hi - lo == 0, 1, hi - lo)   # == MinMaxScaler.transform
+    models    = []
+    for p in pts:
+        m = LSTMModel(meta["n_features"], HIDDEN_DIM, NUM_LAYERS, DROPOUT, BIDIRECTIONAL, N_Q).to(device)
+        m.load_state_dict(torch.load(p, map_location=device))
+        models.append(m)
+    current_close = float(df["Close"].iloc[-1])
+    last_t = torch.tensor(scaled[-WINDOW:], dtype=torch.float32).unsqueeze(0)
+    fc_q   = predict_ensemble(models, last_t).squeeze(0)
+    meta["forecast"] = {
+        "from_date":     str(df.index[-1].date()),
+        "horizon_days":  HORIZON,
+        "current_close": current_close,
+        "p10_pct":       round(float(fc_q[0]), 4),
+        "p50_pct":       round(float(fc_q[1]), 4),
+        "p90_pct":       round(float(fc_q[2]), 4),
+        "signal":        "BUY" if fc_q[1] > 0 else "SELL",
+    }
+    return meta
+
+
+def main():
+    global _SECTOR_NAME, SECTOR_ETF
+    _SECTOR_NAME, SECTOR_ETF = _get_sector_etf(TICKER)
+    df   = load_and_prepare_data(TICKER, PERIOD)
+    meta = train_and_forecast(df, TICKER, _SECTOR_NAME, SECTOR_ETF, model_dir=".")
+    plot(*meta["_plot"])
 
 
 if __name__ == "__main__":
