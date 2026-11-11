@@ -594,7 +594,7 @@ def walk_forward_evaluate(values: np.ndarray, close_raw: np.ndarray,
         true_k = yt.squeeze(1).numpy()
 
         met = compute_metrics(pred_q, true_k)
-        results.append({**met, "fold": k + 1})
+        results.append({**met, "fold": k + 1, "n_test": len(Xt)})
 
         ideal_cov = int((QUANTILES[-1] - QUANTILES[0]) * 100)
         print(f"  >>  ep={ep:3d}  best_val={bv:.4f}  {fold_sec:.0f}s  |  "
@@ -761,6 +761,9 @@ def train_and_forecast(df: pd.DataFrame, ticker: str, sector: str, sector_etf: s
     wf_metrics = {f"wf_{m}_mean": float(np.mean([r[m] for r in wf_results])) if wf_results else None
                   for m in ("rmse", "mae", "dir_acc", "ic", "coverage")}
     wf_metrics["wf_folds"] = len(wf_results)
+    # per-fold detail (metadata only): lets callers test the IC with the real test sample size
+    wf_metrics["wf_ic_folds"]     = [float(r["ic"]) for r in wf_results]
+    wf_metrics["wf_n_test_folds"] = [int(r["n_test"]) for r in wf_results]
 
     # ── Final ensemble model ───────────────────────────────────────────────────
     print("\n" + "=" * 78)
